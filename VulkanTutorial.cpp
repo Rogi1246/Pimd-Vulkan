@@ -8,6 +8,7 @@
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <limits>
 
 
 #define ASSERT_VULKAN(val)\
@@ -32,6 +33,9 @@ VkRenderPass renderPass;
 VkPipeline pipeline;
 VkCommandPool commandPool;
 VkCommandBuffer *commandBuffers;
+VkQueue queue; //again: dummy
+VkSemaphore semaphoreImageAvailable;
+VkSemaphore semaphoreRenderingDone;
 uint32_t amountOfImagesInSwapchain = 0;
 GLFWwindow *window;
 
@@ -298,7 +302,6 @@ void startVulkan() {
     result = vkCreateDevice(physicalDevices[0], &deviceCreateInfo, nullptr, &device);
     ASSERT_VULKAN(result);
 
-    VkQueue queue; //again: dummy
     vkGetDeviceQueue(device, 0, 0, &queue);
 
     VkBool32 surfaceSupport = false;
@@ -517,6 +520,15 @@ void startVulkan() {
     subpassDescription.preserveAttachmentCount = 0;
     subpassDescription.pPreserveAttachments = nullptr; //attachment thats not used directly in this subpass but which data is still wanted to be preserved
 
+    VkSubpassDependency subpassDependency;
+    subpassDependency.srcSubpass = VK_SUBPASS_EXTERNAL; //Index of the subpasses; first one incoming
+    subpassDependency.dstSubpass = 0; //same; where it should go
+    subpassDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; //when to execute
+    subpassDependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    subpassDependency.srcAccessMask = 0;
+    subpassDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    subpassDependency.dependencyFlags = 0;
+
     VkRenderPassCreateInfo renderPassCreateInfo;
     renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     renderPassCreateInfo.pNext = nullptr;
@@ -525,8 +537,8 @@ void startVulkan() {
     renderPassCreateInfo.pAttachments = &attachmentDescription; //pointer to those
     renderPassCreateInfo.subpassCount = 1;
     renderPassCreateInfo.pSubpasses = &subpassDescription;
-    renderPassCreateInfo.dependencyCount = 0; //you can make the subpasses dependent on each other; (f.e. draw them one after the other, so one's only drawn when the other's finished)
-    renderPassCreateInfo.pDependencies = nullptr;
+    renderPassCreateInfo.dependencyCount = 1; //you can make the subpasses dependent on each other; (f.e. draw them one after the other, so one's only drawn when the other's finished)
+    renderPassCreateInfo.pDependencies = &subpassDependency;
 
     result = vkCreateRenderPass(device, &renderPassCreateInfo, nullptr, &renderPass);
     ASSERT_VULKAN(result);
@@ -619,11 +631,39 @@ void startVulkan() {
         result = vkBeginCommandBuffer(commandBuffers[i], &commandBufferBeginInfo);
         ASSERT_VULKAN(result);
 
-        //TODO .. stuff
+        //starting renderpass in commandbuffer
+        VkRenderPassBeginInfo renderPassBeginInfo;
+        renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassBeginInfo.pNext = nullptr;
+        renderPassBeginInfo.renderPass = renderPass;
+        renderPassBeginInfo.framebuffer = framebuffers[i];
+        renderPassBeginInfo.renderArea.offset = {0,0}; //we want to render complete window
+        renderPassBeginInfo.renderArea.extent = {WIDTH, HEIGHT};
+        VkClearValue clearValue = {0.0f, 0.0f, 0.0f, 1.0f};
+        renderPassBeginInfo.clearValueCount = 1; //what's happening at the beginning of framebuffer
+        renderPassBeginInfo.pClearValues = &clearValue;
+
+        //record start and end of renderpass; start recording : vkCmd
+        vkCmdBeginRenderPass(commandBuffers[i], &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+        //bind pipeline for graphics
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
+        //ending recording
+        vkCmdEndRenderPass(commandBuffers[i]);
 
         result = vkEndCommandBuffer(commandBuffers[i]);
         ASSERT_VULKAN(result);
     }
+
+    VkSemaphoreCreateInfo semaphoreCreateInfo;
+    semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semaphoreCreateInfo.pNext = nullptr;
+    semaphoreCreateInfo.flags = 0;
+
+    result = vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &semaphoreImageAvailable);
+    ASSERT_VULKAN(result);
+    result = vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &semaphoreRenderingDone);
+    ASSERT_VULKAN(result);
 
     //Clean up C++ - delete all "news" created in main function!
     //when using the vector version, delete is no longer needed
@@ -634,9 +674,47 @@ void startVulkan() {
 
 }
 
+void drawFrame(){
+    //get Image from swapchain, render into it and give it back to swapchain so it will be displayed
+    //semaphores : objects that can be triggered to either let stuff through or blocks, to force keeping to sequence
+    uint32_t imageIndex;
+    vkAcquireNextImageKHR(device, swapchain, std::numeric_limits<uint64_t>::max(), semaphoreImageAvailable, VK_NULL_HANDLE, &imageIndex); //timeout : how many nano seconds are given at max to acquire image, numeric limits : maximum time given
+
+    VkSubmitInfo submitInfo;
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.pNext = nullptr;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &semaphoreImageAvailable;
+    VkPipelineStageFlags waitStageMask[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT }; //could add commata and add several more
+    submitInfo.pWaitDstStageMask = waitStageMask; //where in the pipeline should it wait for the semaphore; Here : when color attachment starts
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &(commandBuffers[imageIndex]);
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &semaphoreRenderingDone; //on false, is blocking when other commands are waiting
+
+    VkResult result = vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    ASSERT_VULKAN(result);
+
+    //vulkan distinguishes between rendering and presenting on screen
+    VkPresentInfoKHR presentInfo;
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.pNext = nullptr;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &semaphoreRenderingDone;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &swapchain;
+    presentInfo.pImageIndices = &imageIndex;
+    presentInfo.pResults = nullptr;
+
+    result = vkQueuePresentKHR(queue, &presentInfo);
+    ASSERT_VULKAN(result);
+}
+
 void gameLoop() {
     while(!glfwWindowShouldClose(window)){
         glfwPollEvents();
+        //so the frame actually shows
+        drawFrame();
     }
 }
 
@@ -644,6 +722,8 @@ void shutdownVulkan() {
     //make sure all functions on device are finished / everything's returned
     vkDeviceWaitIdle(device);
 
+    vkDestroySemaphore(device, semaphoreImageAvailable, nullptr);
+    vkDestroySemaphore(device, semaphoreRenderingDone, nullptr);
     vkFreeCommandBuffers(device, commandPool, amountOfImagesInSwapchain, commandBuffers); //not necessary BUT f.e. if in your game needs one special command buffer thats being allocated before the level and then freed
     delete[] commandBuffers;
     vkDestroyCommandPool(device, commandPool, nullptr);
